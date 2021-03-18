@@ -1,0 +1,603 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+```{r}
+
+
+library(readr)
+tele <- read_csv("C:\\Users\\Rober\\OneDrive\\Documents\\Uni Stuff\\NOTEBOOKS\\Class\\telecom.csv")
+
+View(tele)
+```
+```{r}
+library("tidyverse")
+library("ggplot2")
+library("magrittr") 
+library("dplyr") 
+library("data.table")
+library("mlr3verse")
+library("paradox")
+library("mlr3tuning")
+```
+
+```{R}
+library("skimr")
+skim(tele)
+#data exploration
+```
+```{r}
+#Data manipulation
+library("plyr")
+library("FSA")
+library("corrplot")
+library("gridExtra")
+library("GGally")
+tele <- tele[complete.cases(tele), ]
+
+group_tenure <- function(tenure){
+    if (tenure >= 0 & tenure <= 12){
+        return('0-12 Month')
+    }else if(tenure > 12 & tenure <= 24){
+        return('12-24 Month')
+    }else if (tenure > 24 & tenure <= 48){
+        return('24-48 Month')
+    }else if (tenure > 48 & tenure <=60){
+        return('48-60 Month')
+    }else if (tenure > 60){
+        return('> 60 Month')
+    }
+}
+tele$tenure_group <- sapply(tele$tenure,group_tenure)
+tele$tenure_group <- as.factor(tele$tenure_group)
+
+#tele$tenure <- NULL
+tele$TotalCharges <- NULL
+
+#view(tele)
+
+
+ggpairs(tele%>% select(tenure,MonthlyCharges,Churn),aes(color =Churn ))
+
+hist(tele[["MonthlyCharges"]], main = "Histogram of monthly charges")
+
+
+```
+
+
+
+
+
+
+
+
+
+```{R}
+#2/3)
+#Base model analysis
+
+lrn_cart <- lrn("classif.rpart", predict_type = "prob")
+
+lrn_glm <- lrn("classif.glmnet", predict_type = "prob", alpha = 0)
+pl_glm <- po("encode") %>>% po(lrn_glm)
+
+lrn_feat <- lrn("classif.featureless", predict_type = "prob")
+
+#lrn_lda <- lrn("classif.lda", predict_type = "prob")
+#pl_lda <-  po(lrn_lda)
+
+
+
+lrn_ranger <- lrn("classif.ranger", predict_type = "prob")
+pl_ranger<-  po(lrn_ranger)
+
+lrn_xgboost <- lrn("classif.xgboost", predict_type = "prob", eval_metric= "error")
+pl_xgb <- po("encode") %>>% po(lrn_xgboost)
+
+tele = tele %>% mutate_if(sapply(tele, is.character), as.factor)
+
+#tele$Churn <- factor(tele$Churn, levels=c(0, 1))
+
+credit_task <- TaskClassif$new(id = "telee",
+                               backend = tele, # <- NB: no na.omit() this time
+                               target = "Churn",
+                               positive = "Yes")
+
+
+
+
+cv5 <- rsmp("holdout")
+cv5$instantiate(credit_task)
+# Now fit as normal ... we can just add it to our benchmark set
+
+res <- benchmark(data.table(
+  task       = list(credit_task),
+  learner    = list(lrn_cart,pl_glm,
+                    lrn_feat,
+                    pl_ranger,
+                    pl_xgb),
+  resampling = list(cv5)
+), store_models = TRUE)
+
+
+res$aggregate(list(msr("classif.ce"),
+                   msr("classif.fpr"),
+                   msr("classif.fnr")))
+
+
+```
+
+```{R}
+#2/3)
+#Tested the params I found through tuning (see tuning code below this cell)
+#Note only tuned xgboost as GLMNET has a model called CV_GLMNET which tunes the regularisation param for us
+
+
+lrn_cart <- lrn("classif.rpart", predict_type = "prob")
+
+lrn_rcart <- lrn("classif.rpart", predict_type = "prob",cp = 0.013)#0.013
+
+lrn_ranger <- lrn("classif.ranger", predict_type = "prob")
+pl_ranger<- po(lrn_ranger)	
+
+lrn_rranger <- lrn("classif.ranger", predict_type = "prob", num.trees = 248, max.depth = 16)
+pl_rranger<-  po(lrn_rranger)
+
+
+
+credit_task <- TaskClassif$new(id = "telee",
+                               backend = tele, # <- NB: no na.omit() this time
+                               target = "Churn",               positive = "Yes")
+
+
+cv5 <- rsmp("holdout")
+cv5$instantiate(credit_task)
+# Now fit as normal ... we can just add it to our benchmark set
+
+res <- benchmark(data.table(
+  task       = list(credit_task),
+  learner    = list(lrn_cart,
+                    lrn_rcart,
+                    pl_ranger,
+                    pl_rranger),
+  resampling = list(cv5)
+), store_models = TRUE)
+
+
+res$aggregate(list(msr("classif.ce"),
+                   msr("classif.fpr"),
+                   msr("classif.fnr"),
+                   msr("classif.fn"),
+                   msr("classif.fp"),
+                   msr("classif.tp"),
+                   msr("classif.tn")
+                   ))
+
+
+```
+
+```{R}
+
+#Next 4 cells are the ROC curves
+library(mlr3viz)
+library(precrec)
+tasks = credit_task
+
+learner    = list(lrn_cart,lrn_rcart, lrn_ranger,lrn_rranger)
+resampling = rsmp("bootstrap")
+#try bootstrap on the rest
+#check i am using all the column in the data
+#try larger grid values
+#try chan ging thr fp trade off values
+#look at bentchmarking bookm arkj
+object = benchmark(benchmark_grid(tasks, learner, resampling))
+
+head(fortify(object))
+
+autoplot(object)
+```
+
+
+
+
+```{R}
+
+#Next 4 cells are the ROC curves
+library(mlr3viz)
+library(precrec)
+tasks = credit_task
+
+learner    = list(lrn("classif.rpart", predict_type = "prob"))
+resampling = cv5
+object = benchmark(benchmark_grid(tasks, learner, resampling))
+
+head(fortify(object))
+
+autoplot(object)
+
+autoplot(object$clone(deep = TRUE), type = "roc")
+```
+```{R}
+library(mlr3viz)
+library(precrec)
+tasks = credit_task
+
+learner    =  lrn("classif.rpart", predict_type = "prob",cp = 0.013)
+resampling = cv5
+object = benchmark(benchmark_grid(tasks, learner, resampling))
+
+head(fortify(object))
+
+autoplot(object)
+
+autoplot(object$clone(deep = TRUE), type = "roc")
+```
+
+
+```{R}
+library(mlr3viz)
+library(precrec)
+tasks = credit_task
+
+learner    = lrn("classif.ranger", predict_type = "prob" )
+resampling = cv5
+object = benchmark(benchmark_grid(tasks, learner, resampling))
+
+head(fortify(object))
+
+autoplot(object)
+
+autoplot(object$clone(deep = TRUE), type = "roc")
+```
+
+
+```{R}
+library(mlr3viz)
+library(precrec)
+tasks = credit_task
+
+learner    = lrn("classif.ranger", predict_type = "prob", num.trees = 248, max.depth = 16)
+resampling = cv5
+object = benchmark(benchmark_grid(tasks, learner, resampling))
+
+head(fortify(object))
+
+autoplot(object)
+
+autoplot(object$clone(deep = TRUE), type = "roc")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{R}
+#plot of cost penalty for tree
+lrn_cart_cv <- lrn("classif.rpart", predict_type = "prob",xval=10)
+cv5 <- rsmp("bootstrap")
+res_cart_cv <- resample(credit_task, lrn_cart_cv, cv5, store_models = TRUE)
+
+
+rpart::plotcp(res_cart_cv$learners[[10]]$model)
+```
+
+
+
+```{R}
+lrn_ranger$param_set
+```
+
+```{R}
+
+#Tuning NO. of trees & max depth
+learner <- lrn("classif.ranger", predict_type = "prob")
+
+
+search_space = ps(
+  num.trees = p_int(lower = 200, upper = 500),
+  max.depth = p_int(lower = 2, upper = 30)
+  
+)
+
+
+
+hout <- rsmp("holdout")
+measure = msr("classif.acc")
+
+
+evals20 = trm("evals", n_evals = 10)
+
+task<-TaskClassif$new(id = "telee",
+                               backend = na.omit(tele), # <- NB: no na.omit() this time
+                               target = "Churn",
+                               positive = "Yes")
+
+instance = TuningInstanceSingleCrit$new(
+  task = task,
+  learner = learner,
+  resampling = hout,
+  measure = measure,
+  search_space = search_space,
+  terminator = evals20
+)
+instance
+
+
+tuner = tnr("grid_search", resolution = 250)
+tuner$optimize(instance)
+``` 
+
+```{R}
+lrn_cart$param_set
+```
+
+```{R}
+
+#tuning tree i.e the penalty cost
+
+learner <- lrn("classif.rpart", predict_type = "prob")
+
+
+
+search_space = ps(
+  cp = p_dbl(lower = 0.0001, upper = 0.1)
+)
+
+#tele = tele %>% mutate_if(sapply(tele, is.character), as.factor)
+
+hout <- rsmp("holdout")
+measure = msr("classif.acc")
+
+
+evals20 = trm("evals", n_evals = 10)
+
+task<-TaskClassif$new(id = "telee",
+                               backend = tele, # <- NB: no na.omit() this time
+                               target = "Churn",
+                               positive = "Yes")
+
+
+
+instance = TuningInstanceSingleCrit$new(
+  task = task,
+  learner = learner,
+  resampling = hout,
+  measure = measure,
+  search_space = search_space,
+  terminator = evals20
+)
+instance
+
+
+tuner = tnr("grid_search", resolution = 250)
+tuner$optimize(instance)
+
+
+```
+
+```{R}
+
+```
+
+
+```{R}
+
+
+#optimising for the false positive rate
+
+
+
+gr = lrn("classif.rpart", predict_type = "prob") %>>% po("threshold")
+learner = GraphLearner$new(gr)
+
+
+search_space = ps(
+  threshold.thresholds = p_dbl(lower = 0.36, upper = 0.64)
+)
+
+
+terminator = trm("evals", n_evals = 10)
+tuner = tnr("grid_search")
+
+at = AutoTuner$new(
+  learner = learner,
+  resampling = rsmp("holdout"),
+  measure = msr("classif.fnr"),
+  search_space = search_space,
+  terminator = terminator,
+  tuner = tuner
+)
+at
+
+grid = benchmark_grid(
+  task = task,
+  learner = list(at, lrn("classif.rpart")),
+  resampling = rsmp("cv", folds = 3)
+)
+
+# avoid console output from mlr3tuning
+logger = lgr::get_logger("bbotk")
+logger$set_threshold("warn")
+
+bmr = benchmark(grid)
+bmr$aggregate(msrs(c("classif.ce",
+                   "classif.fpr",
+                   "classif.fnr",
+                   "classif.fn",
+                   "classif.fp",
+                   "classif.tp",
+                   "classif.tn")))
+
+
+
+
+```
+
+
+
+```{R}
+#optimising for the false positive rate
+
+
+task<-TaskClassif$new(id = "telee",
+                               backend = na.omit(tele), # <- NB: no na.omit() this time
+                               target = "Churn",
+                               positive = "Yes")
+
+gr = lrn("classif.ranger", predict_type = "prob") %>>% po("threshold")
+
+learner = GraphLearner$new(gr) 
+
+
+search_space = ps(
+  threshold.thresholds = p_dbl(lower = 0.35, upper = 0.65)
+)
+
+
+terminator = trm("evals", n_evals = 10)
+tuner = tnr("grid_search")
+
+at = AutoTuner$new(
+  learner = learner,
+  resampling = rsmp("holdout"),
+  measure = msr("classif.fnr"),
+  search_space = search_space,
+  terminator = terminator,
+  tuner = tuner
+)
+at
+
+grid = benchmark_grid(
+  task = task,
+  learner = list(at, lrn("classif.ranger")),
+  resampling = rsmp("holdout")
+)
+
+# avoid console output from mlr3tuning
+logger = lgr::get_logger("bbotk")
+logger$set_threshold("warn")
+
+bmr = benchmark(grid)
+bmr$aggregate(msrs(c("classif.ce",
+                   "classif.fpr",
+                   "classif.fnr",
+                   "classif.fn",
+                   "classif.fp",
+                   "classif.tp",
+                   "classif.tn")))
+
+
+
+```
+```{R}
+
+lrn_cart <- lrn("classif.rpart", predict_type = "prob")
+
+
+credit_task <- TaskClassif$new(id = "telee",
+                               backend = tele, # <- NB: no na.omit() this time
+                               target = "Churn",               positive = "Yes")
+
+
+cv5 <- rsmp("cv", folds = 10)
+cv5$instantiate(credit_task)
+# Now fit as normal ... we can just add it to our benchmark set
+
+res <- benchmark(data.table(
+  task       = list(credit_task),
+  learner    = list(lrn_cart),
+  resampling = list(cv5)
+), store_models = TRUE)
+
+
+res$aggregate(list(msr("classif.ce")))
+
+
+
+trees <- res$resample_result(1)
+
+# Then, let's look at the tree from first CV iteration, for example:
+tree1 <- trees$learners[[1]]
+
+# This is a fitted rpart object, so we can look at the model within
+tree1_rpart <- tree1$model
+
+# If you look in the rpart package documentation, it tells us how to plot the
+# tree that was fitted
+
+plot(tree1_rpart, compress = TRUE)
+
+text(tree1_rpart, use.n = TRUE)
+```
+
+
+
+
+```{R}
+library(mlr)
+library(randomForest)
+
+lrns = list(
+    makeLearner('classif.rpart', predict.type="prob"),
+  "classif.randomForest"
+)
+regr.task = makeClassifTask(id = "telee", data = na.omit(tele), target = "Churn")
+
+rin = makeResampleDesc(method = "Holdout")
+lc = generateLearningCurveData(learners = lrns, task = regr.task,
+  percs = seq(0.1, 1, by = 0.1), measures = acc,
+  resampling = rin, show.info = FALSE)
+plotLearningCurve(lc)
+```
+```{R}
+lrns = list(
+    makeLearner('classif.rpart', predict.type="prob"),
+  makeLearner("classif.randomForest",ntree = 2,mtry = 1, nodesize=2)
+)
+
+rin2 = makeResampleDesc(method = "Holdout", predict = "both")
+lc2 = generateLearningCurveData(learners = lrns, task = regr.task,
+  percs = seq(0.1, 1, by = 0.1),
+  measures = list(acc, setAggregation(acc, train.mean)), resampling = rin2,
+  show.info = FALSE)
+plotLearningCurve(lc2, facet = "learner")
+```
+
+
+
