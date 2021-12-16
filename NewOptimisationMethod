@@ -1,0 +1,212 @@
+class MY(Optimizer):
+    r"""Implements Adam and SGD mix algorithm.
+    """
+
+    def __init__(self,
+                 params,
+                 lr=1e-3, weight_decay=0,
+                 betas=(0.9, 0.999), eps=1e-8, amsgrad=False,
+                 momentum=0, dampening=0, nesterov=False,SGD_weight = 0.5, Adam_weight = 0.8, opPrint = True):    
+        if not 0.0 <= lr:
+            raise ValueError("Invalid learning rate: {}".format(lr))
+        if not 0.0 <= eps:
+            raise ValueError("Invalid epsilon value: {}".format(eps))
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
+        if not 0.0 <= weight_decay:
+            raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
+        defaults = dict(
+            lr=lr, weight_decay=weight_decay,
+            betas=betas, eps=eps, amsgrad=amsgrad,
+            momentum=momentum, dampening=dampening, nesterov=nesterov,Adam_weight = Adam_weight, SGD_weight = SGD_weight,
+            phase = 'ADAM', SGD_lr = 0.01
+        )
+        super(MY, self).__init__(params, defaults)
+
+    def __setstate__(self, state):
+        super(MY, self).__setstate__(state)
+        for group in self.param_groups:
+            group.setdefault('amsgrad', False)
+            group.setdefault('nesterov', False)
+
+    @torch.no_grad()
+    def step(self ,current_epoch, No_epoch, adam_phase, mix_phase, Mix_batch_count,opPrint = True, closure=None):
+        """Performs a single optimization step.
+
+        Arguments:
+            closure (callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        #print("MY")
+        #print(Mix_batch_count)
+        inc_list = np.linspace(0,1,round(mix_phase*No_epoch))
+        #print(inc_list)
+        #inc_list = np.logspace(np.log10(0.01), np.log10(1), int((adam_phase*No_epoch + mix_phase*No_epoch)-adam_phase*No_epoch))
+
+        for group in self.param_groups:
+            
+            if current_epoch <= adam_phase*No_epoch:
+                
+                group['phase'] = "ADAM"
+                if opPrint == True:
+                    print("ADAM | Current epoch = ",current_epoch)
+
+
+            elif adam_phase*No_epoch < current_epoch <= (adam_phase*No_epoch + mix_phase*No_epoch):
+
+                group['phase'] = 'MIX'
+                group['Adam_weight'] = 1-inc_list[Mix_batch_count]
+                group['SGD_weight'] = inc_list[Mix_batch_count]
+                
+                if opPrint == True:
+                    print("\nMix batch count = ", Mix_batch_count)
+                    print("\nMIX | Current epoch = ",current_epoch)
+                    print("MIX | SGD Weight = ",group['SGD_weight'])
+                    print("MIX | Adam Weight = ",group['Adam_weight'])
+
+            else:
+                group['phase'] = 'SGD'
+                if opPrint == True:
+                    print("SGD | Current epoch = ",current_epoch)
+            
+            for p in group['params']:
+
+                if p.grad is None:
+                    continue
+                    
+                grad = p.grad   
+                state = self.state[p]
+
+                if group['phase'] == 'SGD':
+                    #print('SGD')
+                    
+                    d_p_sgd = self.sgd_step(grad, group, p)
+                    
+                    p.add_(d_p_sgd, alpha=-abs(group['SGD_lr']).item())
+                    
+                    continue
+                
+                if group['phase'] == 'ADAM':
+                    #print("The phase is now ADAM")
+                    d_p_adam, step_size,exp_avg2, bias_correction2, state['diff'] = self.adam_step(grad, group, p)
+                    
+                    w = d_p_adam*step_size*-1
+                    p.data.add_(w)
+                    
+                    
+                if group['phase'] == 'MIX':
+                    #print("The phase is now MIX")
+                    
+                    d_p_adam, step_size, exp_avg2, bias_correction2, state['diff']  = self.adam_step(grad, group, p)
+                    
+                    w = d_p_adam*step_size*-1
+
+                    d_p_sgd = self.sgd_step(grad, group, p)
+                    
+                    megred_d_p = group['SGD_weight'] * d_p_sgd + group['Adam_weight'] * d_p_adam
+            
+                    merged_lr = group['SGD_weight'] * abs(group['SGD_lr']) + group['Adam_weight'] * step_size
+
+                    p.add_(megred_d_p, alpha=-merged_lr.item())
+                            
+                
+                
+                #print("len of grad and p =", len(grad.view(-1)), len(w.view(-1)))
+                p_view = w.view(-1)
+                pg = p_view.dot(grad.view(-1))
+                beta1, beta2 = group['betas']
+
+                
+                # the non-orthognal scaling estimate
+                scaling = p_view.dot(p_view) / -pg
+                exp_avg2.mul_(beta2).add_(scaling, alpha=1 - beta2)
+
+                # bias corrected exponential average
+                corrected_exp_avg = exp_avg2 / bias_correction2
+                #print(current_epoch)
+                
+                
+                if current_epoch > adam_phase*No_epoch:        
+                    group['SGD_lr'] = corrected_exp_avg
+                    print("Maws switch at", current_epoch)
+                    print("MAWS SGD_LR = ", abs(group['SGD_lr']))
+                    
+        
+        checker = group['phase']
+        return loss,checker
+        
+               
+    def check(self, group):
+        if group == 'MIX':
+            return True
+
+
+    def adam_step(self, grad, group, p):
+        amsgrad = group['amsgrad']
+        state = self.state[p]
+        # State initialization
+        if len(state) == 0:
+            #state['SGD_lr'] = 0.01
+            state['diff'] = 10.0
+            state['exp_avg2'] = p.new(1).fill_(0)
+            state['step'] = 0
+            # Exponential moving average of gradient values
+            state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+            # Exponential moving average of squared gradient values
+            state['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+            if amsgrad:
+                # Maintains max of all exp. moving avg. of sq. grad. values
+                state['max_exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+        exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+        if amsgrad:
+            max_exp_avg_sq = state['max_exp_avg_sq']
+        beta1, beta2 = group['betas']
+        state['step'] += 1
+        bias_correction1 = 1 - beta1 ** state['step']
+        bias_correction2 = 1 - beta2 ** state['step']
+        if group['weight_decay'] != 0:
+            grad = grad.add(p, alpha=group['weight_decay'].item())
+        # Decay the first and second moment running average coefficient
+        exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+        exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+        if amsgrad:
+            # Maintains the maximum of all 2nd moment running avg. till now
+            torch.max(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
+            # Use the max. for normalizing running avg. of gradient
+            denom = (max_exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(group['eps'])
+        else:
+            denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(group['eps'])
+        step_size = group['lr'] / bias_correction1
+
+        d_p = exp_avg / denom
+        return d_p, step_size, state['exp_avg2'], bias_correction2, state['diff']
+
+    def sgd_step(self, grad, group, p):
+        d_p = grad
+        weight_decay = group['weight_decay']
+        momentum = group['momentum']
+        dampening = group['dampening']
+        nesterov = group['nesterov']
+        if weight_decay != 0:
+            d_p = d_p.add(p, alpha=weight_decay.item())
+        if momentum != 0:
+            param_state = self.state[p]
+            if 'momentum_buffer' not in param_state:
+                buf = param_state['momentum_buffer'] = torch.clone(d_p).detach()
+            else:
+                buf = param_state['momentum_buffer']
+                buf.mul_(momentum).add_(d_p, alpha=1 - dampening)
+            if nesterov:
+                d_p = d_p.add(buf, alpha=momentum.item())
+            else:
+                d_p = buf
+
+        return d_p
